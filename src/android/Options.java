@@ -27,13 +27,16 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.Set;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import android.app.Activity;
 import android.app.AlarmManager;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
@@ -42,6 +45,7 @@ import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.StrictMode;
 import android.os.StrictMode.ThreadPolicy;
+import android.util.Log;
 
 /**
  * Class that helps to store the options that can be specified per alarm.
@@ -83,7 +87,7 @@ public class Options {
         } else if (repeat.equalsIgnoreCase("yearly")) {
             interval = AlarmManager.INTERVAL_DAY*365;
         } else if (repeat.equalsIgnoreCase("progressively")) {
-            interval = AlarmManager.INTERVAL_HOUR / 12;
+            interval = AlarmManager.INTERVAL_HOUR / 2;
         } else {
             try {
                 interval = Integer.parseInt(repeat) * 60000;
@@ -98,9 +102,31 @@ public class Options {
      */
     public Options moveDate () {
     	String repeat = this.options.optString("repeat");
+    	String id = this.options.optString("id");
+    	
+    	SharedPreferences alarms = LocalNotification.getSharedPreferences();
+    	
         try {
+        	JSONArray args  = new JSONArray(alarms.getString(id, ""));
+        	JSONObject optionsNot = args.getJSONObject(0);
+        			
+        	Calendar calendar = Calendar.getInstance();
+        	calendar.setTime(new Date());
+        	long time= System.currentTimeMillis();
+        	
+        	long notificationTime = optionsNot.optLong("date", 0) * 1000;
+        	long androidTime = time;
+        	
+        	long difTime = androidTime - notificationTime;
+
         	if(repeat.equalsIgnoreCase("progressively")){        		
-        		interval = interval * 2;
+        		if(difTime > interval){
+        			if(difTime >= AlarmManager.INTERVAL_DAY){
+        				interval = AlarmManager.INTERVAL_DAY;
+        			} else {
+        				interval = difTime * 2;        				
+        			}
+        		}
         	}
         	options.put("date", (getDate() + interval) / 1000);        		
         } catch (JSONException e) {}
