@@ -21,374 +21,401 @@
 
 package de.appplant.cordova.plugin.localnotification;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.util.Calendar;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.Map;
 import java.util.Set;
 
+import org.apache.cordova.CallbackContext;
+import org.apache.cordova.CordovaInterface;
+import org.apache.cordova.CordovaPlugin;
+import org.apache.cordova.CordovaWebView;
+import org.apache.cordova.PluginResult;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import android.app.Activity;
 import android.app.AlarmManager;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.res.AssetManager;
-import android.content.res.Resources;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.media.RingtoneManager;
-import android.net.Uri;
-import android.os.StrictMode;
-import android.os.StrictMode.ThreadPolicy;
-import android.util.Log;
+import android.content.SharedPreferences.Editor;
 
 /**
- * Class that helps to store the options that can be specified per alarm.
+ * This plugin utilizes the Android AlarmManager in combination with StatusBar
+ * notifications. When a local notification is scheduled the alarm manager takes
+ * care of firing the event. When the event is processed, a notification is put
+ * in the Android status bar.
  */
-public class Options {
+public class LocalNotification extends CordovaPlugin {
 
-    private JSONObject options = new JSONObject();
-    private String packageName = null;
-    private long interval      = 0;
+    protected final static String PLUGIN_NAME = "LocalNotification";
 
-    Options (Activity activity) {
-        packageName = activity.getPackageName();
+    private   static CordovaWebView webView = null;
+    private   static Boolean deviceready = false;
+    protected static Context context = null;
+    protected static Boolean isInBackground = true;
+    private   static ArrayList<String> eventQueue = new ArrayList<String>();
+
+    @Override
+    public void initialize (CordovaInterface cordova, CordovaWebView webView) {
+        super.initialize(cordova, webView);
+
+        LocalNotification.webView = super.webView;
+        LocalNotification.context = super.cordova.getActivity().getApplicationContext();
     }
 
-    Options (Context context) {
-        packageName = context.getPackageName();
-    }
+    @Override
+    public boolean execute (String action, final JSONArray args, final CallbackContext command) throws JSONException {
+        if (action.equalsIgnoreCase("add")) {
+            cordova.getThreadPool().execute( new Runnable() {
+                public void run() {
+                    JSONObject arguments = args.optJSONObject(0);
+                    Options options      = new Options(context).parse(arguments);
 
-    /**
-     * Parses the given properties
-     */
-    public Options parse (JSONObject options) {
-        String repeat = options.optString("repeat");
-
-        this.options = options;
-
-        if (repeat.equalsIgnoreCase("secondly")) {
-            interval = 1000;
-        } if (repeat.equalsIgnoreCase("minutely")) {
-            interval = AlarmManager.INTERVAL_FIFTEEN_MINUTES / 15;
-        } if (repeat.equalsIgnoreCase("hourly")) {
-            interval = AlarmManager.INTERVAL_HOUR;
-        } if (repeat.equalsIgnoreCase("daily")) {
-            interval = AlarmManager.INTERVAL_DAY;
-        } else if (repeat.equalsIgnoreCase("weekly")) {
-            interval = AlarmManager.INTERVAL_DAY*7;
-        } else if (repeat.equalsIgnoreCase("monthly")) {
-            interval = AlarmManager.INTERVAL_DAY*31; // 31 days
-        } else if (repeat.equalsIgnoreCase("yearly")) {
-            interval = AlarmManager.INTERVAL_DAY*365;
-        } else if (repeat.equalsIgnoreCase("progressively")) {
-            interval = AlarmManager.INTERVAL_HOUR / 2;
-        } else {
-            try {
-                interval = Integer.parseInt(repeat) * 60000;
-            } catch (Exception e) {};
+                    persist(options.getId(), args);
+                    add(options, true);
+                    command.success();
+                }
+            });
         }
 
-        return this;
+        if (action.equalsIgnoreCase("cancel")) {
+            cordova.getThreadPool().execute( new Runnable() {
+                public void run() {
+                    String id = args.optString(0);
+
+                    cancel(id);
+                    unpersist(id);
+                    command.success();
+                }
+            });
+        }
+
+        if (action.equalsIgnoreCase("cancelAll")) {
+            cordova.getThreadPool().execute( new Runnable() {
+                public void run() {
+                    cancelAll();
+                    unpersistAll();
+                    command.success();
+                }
+            });
+        }
+
+        if (action.equalsIgnoreCase("isScheduled")) {
+            String id = args.optString(0);
+
+            isScheduled(id, command);
+        }
+
+        if (action.equalsIgnoreCase("getScheduledIds")) {
+            getScheduledIds(command);
+        }
+
+        if (action.equalsIgnoreCase("isTriggered")) {
+            String id = args.optString(0);
+
+            isTriggered(id, command);
+        }
+
+        if (action.equalsIgnoreCase("getTriggeredIds")) {
+            getTriggeredIds(command);
+        }
+
+        if (action.equalsIgnoreCase("deviceready")) {
+            cordova.getThreadPool().execute( new Runnable() {
+                public void run() {
+                    deviceready();
+                }
+            });
+        }
+
+        if (action.equalsIgnoreCase("pause")) {
+            isInBackground = true;
+        }
+
+        if (action.equalsIgnoreCase("resume")) {
+            isInBackground = false;
+        }
+
+        return true;
     }
 
     /**
-     * Set new time according to interval
+     * Calls all pending callbacks after the deviceready event has been fired.
      */
-    public Options moveDate () {
-    	String repeat = this.options.optString("repeat");
-    	String id = this.options.optString("id");
-    	
-    	SharedPreferences alarms = LocalNotification.getSharedPreferences();
-    	
+    private static void deviceready () {
+        deviceready = true;
+
+        for (String js : eventQueue) {
+            webView.sendJavascript(js);
+        }
+
+        eventQueue.clear();
+    }
+
+    /**
+     * Set an alarm.
+     *
+     * @param options
+     *            The options that can be specified per alarm.
+     * @param doFireEvent
+     *            If the onadd callback shall be called.
+     */
+    public static void add (Options options, boolean doFireEvent) {
+        long triggerTime = options.getDate();
+
+        Intent intent = new Intent(context, Receiver.class)
+            .setAction("" + options.getId())
+            .putExtra(Receiver.OPTIONS, options.getJSONObject().toString());
+
+        AlarmManager am  = getAlarmManager();
+        PendingIntent pi = PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_CANCEL_CURRENT);
+
+        if (doFireEvent) {
+            fireEvent("add", options.getId(), options.getJSON());
+        }
+
+        am.set(AlarmManager.RTC_WAKEUP, triggerTime, pi);
+    }
+
+    /**
+     * Cancel a specific notification that was previously registered.
+     *
+     * @param notificationId
+     *            The original ID of the notification that was used when it was
+     *            registered using add()
+     */
+    public static void cancel (String notificationId) {
+        /*
+         * Create an intent that looks similar, to the one that was registered
+         * using add. Making sure the notification id in the action is the same.
+         * Now we can search for such an intent using the 'getService' method
+         * and cancel it.
+         */
+        Intent intent = new Intent(context, Receiver.class)
+            .setAction("" + notificationId);
+
+        PendingIntent pi       = PendingIntent.getBroadcast(context, 0, intent, 0);
+        AlarmManager am        = getAlarmManager();
+        NotificationManager nc = getNotificationManager();
+
+        am.cancel(pi);
+
         try {
-        	JSONArray args  = new JSONArray(alarms.getString(id, ""));
-        	JSONObject optionsNot = args.getJSONObject(0);
-        			
-        	Calendar calendar = Calendar.getInstance();
-        	calendar.setTime(new Date());
-        	long time= System.currentTimeMillis();
-        	
-        	long notificationTime = optionsNot.optLong("date", 0) * 1000;
-        	long androidTime = time;
-        	
-        	long difTime = androidTime - notificationTime;
+            nc.cancel(Integer.parseInt(notificationId));
+        } catch (Exception e) {}
 
-        	if(repeat.equalsIgnoreCase("progressively")){        		
-        		if(difTime > interval){
-        			if(difTime >= AlarmManager.INTERVAL_DAY){
-        				interval = AlarmManager.INTERVAL_DAY;
-        			} else {
-        				interval = difTime * 2;        				
-        			}
-        		}
-        	}
-        	options.put("date", (getDate() + interval) / 1000);        		
-        } catch (JSONException e) {}
-
-        return this;
+        fireEvent("cancel", notificationId, "");
     }
 
     /**
-     * Returns options as JSON object
+     * Cancel all notifications that were created by this plugin.
+     *
+     * Android can only unregister a specific alarm. There is no such thing
+     * as cancelAll. Therefore we rely on the Shared Preferences which holds
+     * all our alarms to loop through these alarms and unregister them one
+     * by one.
      */
-    public JSONObject getJSONObject() {
-        return options;
+    public static void cancelAll() {
+        SharedPreferences settings = getSharedPreferences();
+        NotificationManager nc     = getNotificationManager();
+        Map<String, ?> alarms      = settings.getAll();
+        Set<String> alarmIds       = alarms.keySet();
+
+        for (String alarmId : alarmIds) {
+            cancel(alarmId);
+        }
+
+        nc.cancelAll();
     }
 
     /**
-     * Returns time in milliseconds when notification is scheduled to fire
+     * Checks if a notification with an ID is scheduled.
+     *
+     * @param id
+     *          The notification ID to be check.
+     * @param callbackContext
      */
-    public long getDate() {
-        return options.optLong("date", 0) * 1000;
+    public static void isScheduled (String id, CallbackContext command) {
+        SharedPreferences settings = getSharedPreferences();
+        Map<String, ?> alarms      = settings.getAll();
+        boolean isScheduled        = alarms.containsKey(id);
+        PluginResult result        = new PluginResult(PluginResult.Status.OK, isScheduled);
+
+        command.sendPluginResult(result);
     }
 
     /**
-     * Returns time as calender
+     * Retrieves a list with all currently pending notifications.
+     *
+     * @param callbackContext
      */
-    public Calendar getCalendar () {
-        Calendar calendar = Calendar.getInstance();
+    public static void getScheduledIds (CallbackContext command) {
+        SharedPreferences settings = getSharedPreferences();
+        Map<String, ?> alarms      = settings.getAll();
+        Set<String> alarmIds       = alarms.keySet();
+        JSONArray scheduledIds     = new JSONArray(alarmIds);
 
-        calendar.setTime(new Date(getDate()));
-
-        return calendar;
+        command.success(scheduledIds);
     }
 
     /**
-     * Returns the notification's message
+     * Checks if a notification with an ID was triggered.
+     *
+     * @param id
+     *          The notification ID to be check.
+     * @param callbackContext
      */
-    public String getMessage () {
-        return options.optString("message", "");
+    public static void isTriggered (String id, CallbackContext command) {
+        SharedPreferences settings = getSharedPreferences();
+        Map<String, ?> alarms      = settings.getAll();
+        boolean isScheduled        = alarms.containsKey(id);
+        boolean isTriggered        = isScheduled;
+
+        if (isScheduled) {
+            JSONObject arguments = (JSONObject) alarms.get(id);
+            Options options      = new Options(context).parse(arguments);
+            Date fireDate        = new Date(options.getDate());
+
+            isTriggered = new Date().after(fireDate);
+        }
+
+        PluginResult result = new PluginResult(PluginResult.Status.OK, isTriggered);
+
+        command.sendPluginResult(result);
     }
 
     /**
-     * Returns the notification's title
+     * Retrieves a list with all currently triggered notifications.
+     *
+     * @param callbackContext
      */
-    public String getTitle () {
-        return options.optString("title", "");
-    }
+    public static void getTriggeredIds (CallbackContext command) {
+        SharedPreferences settings = getSharedPreferences();
+        Map<String, ?> alarms      = settings.getAll();
+        Set<String> alarmIds       = alarms.keySet();
+        JSONArray scheduledIds     = new JSONArray();
+        Date now                   = new Date();
 
-    /**
-     * Returns the path of the notification's sound file
-     */
-    public Uri getSound () {
-        String sound = options.optString("sound", null);
+        for (String id : alarmIds) {
+            JSONObject arguments = (JSONObject) alarms.get(id);
+            Options options      = new Options(context).parse(arguments);
+            Date fireDate        = new Date(options.getDate());
+            boolean isTriggered  = now.after(fireDate);
 
-        if (sound != null) {
-            try {
-                int soundId = (Integer) RingtoneManager.class.getDeclaredField(sound).get(Integer.class);
-
-                return RingtoneManager.getDefaultUri(soundId);
-            } catch (Exception e) {
-                return Uri.parse(sound);
+            if (isTriggered == true) {
+                scheduledIds.put(id);
             }
         }
 
-        return null;
+        command.success(scheduledIds);
     }
 
     /**
-     * Returns the icon's ID
-     */
-    public Bitmap getIcon () {
-        String icon = options.optString("icon", "icon");
-        Bitmap bmp = null;
-
-        if (icon.startsWith("http")) {
-            bmp = getIconFromURL(icon);
-        } else if (icon.startsWith("file://")) {
-            bmp = getIconFromURI(icon);
-        }
-
-        if (bmp == null) {
-            bmp = getIconFromRes(icon);
-        }
-
-        return bmp;
-    }
-
-    /**
-     * Returns the small icon's ID
-     */
-    public int getSmallIcon () {
-        int resId       = 0;
-        String iconName = options.optString("smallIcon", "");
-
-        resId = getIconValue(packageName, iconName);
-
-        if (resId == 0) {
-            resId = getIconValue("android", iconName);
-        }
-
-        if (resId == 0) {
-            resId = getIconValue(packageName, "icon");
-        }
-
-        return options.optInt("smallIcon", resId);
-    }
-
-    /**
-     * Returns notification repetition interval (daily, weekly, monthly, yearly)
-     */
-    public long getInterval () {
-        return interval;
-    }
-
-    /**
-     * Returns notification badge number
-     */
-    public int getBadge () {
-        return options.optInt("badge", 0);
-    }
-
-    /**
-     * Returns PluginResults' callback ID
-     */
-    public String getId () {
-        return options.optString("id", "0");
-    }
-
-    /**
-     * Returns whether notification is cancelled automatically when clicked.
-     */
-    public Boolean getAutoCancel () {
-        return options.optBoolean("autoCancel", false);
-    }
-
-    /**
-     * Returns whether the notification is ongoing (uncancellable). Android only.
-     */
-    public Boolean getOngoing () {
-        return options.optBoolean("ongoing", false);
-    }
-
-    /**
-     * Returns additional data as string
-     */
-    public String getJSON () {
-        return options.optString("json", "");
-    }
-
-    /**
-     * @return
-     *      The notification color for LED
-     */
-   public int getColor () {
-        String hexColor = options.optString("led", "000000");
-        int aRGB        = Integer.parseInt(hexColor,16);
-
-        aRGB += 0xFF000000;
-
-        return aRGB;
-    }
-
-    /**
-     * Returns numerical icon Value
+     * Persist the information of this alarm to the Android Shared Preferences.
+     * This will allow the application to restore the alarm upon device reboot.
+     * Also this is used by the cancelAll method.
      *
-     * @param {String} className
-     * @param {String} iconName
+     * @param alarmId
+     *            The Id of the notification that must be persisted.
+     * @param args
+     *            The assumption is that parse has been called already.
      */
-    private int getIconValue (String className, String iconName) {
-        int icon = 0;
+    public static void persist (String alarmId, JSONArray args) {
+        Editor editor = getSharedPreferences().edit();
 
-        try {
-            Class<?> klass  = Class.forName(className + ".R$drawable");
-
-            icon = (Integer) klass.getDeclaredField(iconName).get(Integer.class);
-        } catch (Exception e) {}
-
-        return icon;
+        if (alarmId != null) {
+            editor.putString(alarmId, args.toString());
+            editor.apply();
+        }
     }
 
     /**
-     * Converts an resource to Bitmap.
+     * Remove a specific alarm from the Android shared Preferences.
      *
-     * @param icon
-     *      The resource name
-     * @return
-     *      The corresponding bitmap
+     * @param alarmId
+     *            The Id of the notification that must be removed.
      */
-    private Bitmap getIconFromRes (String icon) {
-        Resources res = LocalNotification.context.getResources();
-        int iconId = 0;
+    public static void unpersist (String alarmId) {
+        Editor editor = getSharedPreferences().edit();
 
-        iconId = getIconValue(packageName, icon);
-
-        if (iconId == 0) {
-            iconId = getIconValue("android", icon);
+        if (alarmId != null) {
+            editor.remove(alarmId);
+            editor.apply();
         }
-
-        if (iconId == 0) {
-            iconId = android.R.drawable.ic_menu_info_details;
-        }
-
-        Bitmap bmp = BitmapFactory.decodeResource(res, iconId);
-
-        return bmp;
     }
 
     /**
-     * Converts an Image URL to Bitmap.
-     *
-     * @param src
-     *      The external image URL
-     * @return
-     *      The corresponding bitmap
+     * Clear all alarms from the Android shared Preferences.
      */
-    private Bitmap getIconFromURL (String src) {
-        Bitmap bmp = null;
-        ThreadPolicy origMode = StrictMode.getThreadPolicy();
+    public static void unpersistAll () {
+        Editor editor = getSharedPreferences().edit();
 
-        try {
-            URL url = new URL(src);
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-
-            StrictMode.ThreadPolicy policy =
-                    new StrictMode.ThreadPolicy.Builder().permitAll().build();
-
-            StrictMode.setThreadPolicy(policy);
-
-            connection.setDoInput(true);
-            connection.connect();
-
-            InputStream input = connection.getInputStream();
-
-            bmp = BitmapFactory.decodeStream(input);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        StrictMode.setThreadPolicy(origMode);
-
-        return bmp;
+        editor.clear();
+        editor.apply();
     }
 
     /**
-     * Converts an Image URI to Bitmap.
+     * Fires the given event.
      *
-     * @param src
-     *      The internal image URI
-     * @return
-     *      The corresponding bitmap
+     * @param {String} event The Name of the event
+     * @param {String} id    The ID of the notification
+     * @param {String} json  A custom (JSON) string
      */
-    private Bitmap getIconFromURI (String src) {
-        AssetManager assets = LocalNotification.context.getAssets();
-        Bitmap bmp = null;
+    public static void fireEvent (String event, String id, String json) {
+        String state  = getApplicationState();
+        String params = "\"" + id + "\",\"" + state + "\",\\'" + JSONObject.quote(json) + "\\'.replace(/(^\"|\"$)/g, \\'\\')";
+        String js     = "setTimeout('plugin.notification.local.on" + event + "(" + params + ")',0)";
 
-        try {
-            String path = src.replace("file:/", "www");
-            InputStream input = assets.open(path);
-
-            bmp = BitmapFactory.decodeStream(input);
-        } catch (IOException e) {
-            e.printStackTrace();
+        // webview may available, but callbacks needs to be executed
+        // after deviceready
+        if (deviceready == false) {
+            eventQueue.add(js);
+        } else {
+            webView.sendJavascript(js);
         }
+    }
 
-        return bmp;
+    /**
+     * Retrieves the application state
+     *
+     * @return {String}
+     *      Either "background" or "foreground"
+     */
+    protected static String getApplicationState () {
+        return isInBackground ? "background" : "foreground";
+    }
+
+    /**
+     * Set the application context if not already set.
+     */
+    protected static void setContext (Context context) {
+        if (LocalNotification.context == null) {
+            LocalNotification.context = context;
+        }
+    }
+
+    /**
+     * The Local storage for the application.
+     */
+    protected static SharedPreferences getSharedPreferences () {
+        return context.getSharedPreferences(PLUGIN_NAME, Context.MODE_PRIVATE);
+    }
+
+    /**
+     * The alarm manager for the application.
+     */
+    protected static AlarmManager getAlarmManager () {
+        return (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+    }
+
+    /**
+     * The notification manager for the application.
+     */
+    protected static NotificationManager getNotificationManager () {
+        return (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
     }
 }
