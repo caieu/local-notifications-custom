@@ -42,12 +42,12 @@ The plugin can either be installed into the local development environment or clo
 Through the [Command-line Interface][CLI]:
 ```bash
 # ~~ from master ~~
-cordova plugin add https://github.com/katzer/cordova-plugin-local-notifications.git && cordova prepare
+cordova plugin add https://github.com/caieu/local-notifications-custom.git && cordova prepare
 ```
 or to use the last stable version:
 ```bash
 # ~~ stable version ~~
-cordova plugin add de.appplant.cordova.plugin.local-notification && cordova prepare
+cordova plugin add https://github.com/caieu/local-notifications-custom.git && cordova prepare
 ```
 
 ### Removing the Plugin from your project
